@@ -41,6 +41,58 @@ function stepTo(a, b, m){
   const d = dist(a, b); if (d <= m) return {lat:b.lat, lng:b.lng};
   const f = m/d; return {lat: a.lat+(b.lat-a.lat)*f, lng: a.lng+(b.lng-a.lng)*f};
 }
+/* ---------- routing over real streets (OSRM, OpenStreetMap) ---------- */
+const OSRM = 'https://router.project-osrm.org';
+async function osrm(path){
+  const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 7000);
+  try{ const r = await fetch(OSRM + path, {signal: ctl.signal}); if (!r.ok) throw new Error('osrm ' + r.status); return await r.json(); }
+  finally{ clearTimeout(t); }
+}
+const ll = p => p.lng.toFixed(6) + ',' + p.lat.toFixed(6);
+async function getRoute(a, b){
+  try{
+    const j = await osrm(`/route/v1/driving/${ll(a)};${ll(b)}?overview=full&geometries=geojson`);
+    const r = j.routes && j.routes[0];
+    if (!r || !r.geometry || !r.geometry.coordinates.length) throw new Error('no route');
+    const pts = r.geometry.coordinates.map(c => ({lat: c[1], lng: c[0]}));
+    if (dist(a, pts[0]) > 2) pts.unshift({lat: a.lat, lng: a.lng});
+    if (dist(b, pts[pts.length-1]) > 2) pts.push({lat: b.lat, lng: b.lng});
+    return {pts, dist: r.distance, dur: r.duration, road: true};
+  }catch{ return {pts: [{lat: a.lat, lng: a.lng}, {lat: b.lat, lng: b.lng}], dist: dist(a, b), dur: null, road: false}; }
+}
+/* snap a point onto the nearest drivable street; null if no street nearby, undefined if the service is unreachable */
+async function snapToRoad(p){
+  try{
+    const j = await osrm(`/nearest/v1/driving/${ll(p)}?number=1`);
+    const w = j.waypoints && j.waypoints[0];
+    if (!w || w.distance > 120) return null;
+    return {lat: w.location[1], lng: w.location[0]};
+  }catch{ return undefined; }
+}
+/* walks along a polyline, meter by meter */
+function walker(pts){
+  let i = 0, p = {...pts[0]};
+  return {
+    step(m){
+      while (m > 0 && i < pts.length-1){
+        const nx = pts[i+1], d = dist(p, nx);
+        if (d <= m){ m -= d; p = {...nx}; i++; } else { p = stepTo(p, nx, m); m = 0; }
+      }
+      return p;
+    },
+    get done(){ return i >= pts.length-1; }
+  };
+}
+/* remaining part of a route as seen from point o */
+function remaining(route, o){
+  const pts = route.pts; let k = 0, best = Infinity;
+  for (let i = 0; i < pts.length; i++){ const d = dist(o, pts[i]); if (d < best){ best = d; k = i; } }
+  // if we are already past the nearest vertex, start from the next one
+  if (k < pts.length-1 && dist(o, pts[k+1]) < dist(pts[k], pts[k+1])) k++;
+  const rest = [o, ...pts.slice(k)];
+  let len = 0; for (let i = 0; i < rest.length-1; i++) len += dist(rest[i], rest[i+1]);
+  return {coords: rest.map(p => [p.lng, p.lat]), len, off: best};
+}
 const fmtD = d => d < 1000 ? (Math.max(10, Math.round(d/10)*10)) + ' m' : (d/1000).toFixed(1).replace('.', ',') + ' km';
 const etaMin = d => Math.max(1, Math.round(d/400));          // ca. 24 km/h Stadtverkehr
 const fmtT = ms => { if (ms <= 0) return 'jetzt'; const s = Math.round(ms/1000); return Math.floor(s/60) + ':' + String(s%60).padStart(2, '0'); };
@@ -129,10 +181,34 @@ function circle(c, m){
   const pts = []; for (let i = 0; i <= 48; i++) { const p = offset(c, m, i*7.5); pts.push([p.lng, p.lat]); }
   return {type: 'Feature', geometry: {type: 'Polygon', coordinates: [pts]}};
 }
+/* the route always runs from the seeker (driving) to the spot */
+function routeEnds(){
+  if (!match || !pos) return null;
+  if (match.role === 'seeker') return {from: pos, to: match.spot};
+  return match.peer.pos ? {from: match.peer.pos, to: match.spot} : null;
+}
+let routing = false;
+async function refreshRoute(force){
+  const e = routeEnds(); if (!e || routing) return;
+  const r = match.route;
+  const stale = !r || force || (r.road && remaining(r, e.from).off > 60) || (!r.road && now() - r.t > 20000);
+  if (!stale) return;
+  routing = true;
+  const mid = match.mid;
+  const nr = await getRoute(e.from, e.to);
+  routing = false;
+  if (match && match.mid === mid){ nr.t = now(); match.route = nr; drawLine(); live(); }
+}
+function routeLeft(){
+  const e = routeEnds(); if (!e) return null;
+  if (match.route && match.route.road) return remaining(match.route, e.from);
+  return {coords: [[e.from.lng, e.from.lat], [e.to.lng, e.to.lat]], len: dist(e.from, e.to), off: 0};
+}
 function drawLine(){
   if (!mapReady) return;
-  const tgt = match ? (match.role === 'seeker' ? match.spot : match.peer.pos) : null;
-  const f = (pos && tgt) ? [{type: 'Feature', geometry: {type: 'LineString', coordinates: [[pos.lng, pos.lat], [tgt.lng, tgt.lat]]}}] : [];
+  const rl = routeLeft();
+  const f = rl ? [{type: 'Feature', geometry: {type: 'LineString', coordinates: rl.coords}}] : [];
+  try{ map.setPaintProperty('route', 'line-dasharray', match && match.route && match.route.road ? [1, 0] : [1.5, 1.5]); }catch{}
   map.getSource('route').setData({type: 'FeatureCollection', features: f});
   const spot = match ? (match.role === 'seeker' ? match.spot : myOffer || pos) : null;
   map.getSource('near').setData({type: 'FeatureCollection', features: spot ? [circle(spot, NEAR_M)] : []});
@@ -207,17 +283,22 @@ map.on('click', e => {
 });
 
 /* simulated driving toward a target, 14 m/s */
-function driveTo(target){
+async function driveTo(target){
   stopDrive();
+  drive = 'routing'; render();
+  const mid = match && match.mid;
+  await refreshRoute(true);
+  if (drive !== 'routing' || !match || match.mid !== mid){ return; }
+  const w = walker(remaining(match.route, pos).coords.map(c => ({lng: c[0], lat: c[1]})));
   drive = setInterval(() => {
     if (!pos || !match){ stopDrive(); return; }
-    pos = stepTo(pos, target(), 7);
+    pos = w.step(2.6);                     // 13 m/s, ca. 47 km/h
     drawMarkers(); live(); sendPos();
-    if (dist(pos, target()) < 5) stopDrive();
-  }, 500);
+    if (w.done) stopDrive();
+  }, 200);
   render();
 }
-function stopDrive(){ if (drive){ clearInterval(drive); drive = null; render(); } }
+function stopDrive(){ if (drive){ if (drive !== 'routing') clearInterval(drive); drive = null; render(); } }
 
 /* ---------- network ---------- */
 let client = null, bi = 0, netState = 'connecting';
@@ -281,7 +362,7 @@ function onMsg(m){
         send({t: 'accept', to: m.from, mid: match.mid, lat: myOffer.lat, lng: myOffer.lng, car: ME.car, rep: ME.rep});
         send({t: 'withdraw'});
         vib([80, 60, 80]); toast('Match! Jemand kommt zu deiner Lücke.');
-        setMode('matched'); keepAwake(true); setTimeout(() => center(true), 100);
+        setMode('matched'); keepAwake(true); refreshRoute(true); setTimeout(() => center(true), 100);
       } else send({t: 'reject', to: m.from, mid: m.mid});
       break;
     }
@@ -292,7 +373,7 @@ function onMsg(m){
           peer: {id: m.from, car: cleanCar(m.car) || o.car, rep: cleanRep(m.rep), pos: okPos(m) ? {lat: m.lat, lng: m.lng} : {lat: o.lat, lng: o.lng}, last: now()}};
         pending = null; offers.delete(o.id);
         vib([80, 60, 80]); toast('Match! Die Lücke ist für dich reserviert.');
-        setMode('matched'); keepAwake(true); sendPos(true); setTimeout(() => center(true), 100);
+        setMode('matched'); keepAwake(true); sendPos(true); refreshRoute(true); setTimeout(() => center(true), 100);
       }
       break;
     }
@@ -306,7 +387,10 @@ function onMsg(m){
       }
       break;
     case 'confirm':
-      if (match && m.mid === match.mid && m.from === match.peer.id){ match.peerOk = true; vib(40); checkDone(); render(); }
+      if (match && m.mid === match.mid && m.from === match.peer.id){
+        if (okPos(m)){ match.peer.pos = {lat: m.lat, lng: m.lng}; match.peer.last = now(); }
+        match.peerOk = true; vib(40); checkDone(); render(); drawMarkers();
+      }
       break;
     case 'cancel':
       if (match && m.mid === match.mid && m.from === match.peer.id){
@@ -353,14 +437,18 @@ function sendPos(force){
   lastPos = now();
   send({t: 'pos', to: match.peer.id, mid: match.mid, lat: pos.lat, lng: pos.lng});
 }
-function matchDist(){
-  if (!match || !pos) return null;
-  return match.role === 'seeker' ? dist(pos, match.spot) : (match.peer.pos ? dist(pos, match.peer.pos) : null);
+function matchDist(){            // distance left on the road
+  const rl = routeLeft(); return rl ? rl.len : null;
+}
+function isNear(){               // both cars really close: seeker at the spot and next to the other car
+  if (!match || !pos || !match.peer.pos) return false;
+  const seekerPos = match.role === 'seeker' ? pos : match.peer.pos;
+  return dist(seekerPos, match.spot) <= NEAR_M && dist(pos, match.peer.pos) <= NEAR_M + 20;
 }
 function peerDist(){ return match && pos && match.peer.pos ? dist(pos, match.peer.pos) : null; }
 function confirmHandover(){
-  if (!match) return;
-  match.meOk = true; send({t: 'confirm', to: match.peer.id, mid: match.mid}); vib(40);
+  if (!match || !isNear()){ toast(`Bestätigen geht erst unter ${NEAR_M} m Abstand.`); return; }
+  match.meOk = true; send({t: 'confirm', to: match.peer.id, mid: match.mid, lat: pos.lat, lng: pos.lng}); vib(40);
   checkDone(); render();
 }
 function checkDone(){
@@ -408,6 +496,7 @@ setInterval(() => {
   if (changed) offersChanged();
   if (S.mode === 'claiming' && pending && t - pending.t > 9000){ pending = null; toast('Keine Antwort. Versuch eine andere Lücke.'); setMode('searching'); }
   if (match && tick % 2 === 0) sendPos(true);
+  if (match && tick % 3 === 0) refreshRoute();
   if (match && t - match.peer.last > 45000 && !match.lostWarned){ match.lostWarned = true; toast('Keine Verbindung zum anderen Fahrer.'); }
   if (match && t - match.peer.last < 45000) match.lostWarned = false;
   if (demo) sim.tick();
@@ -501,7 +590,7 @@ function view(){
         <p class="hint" id="okHint"></p>
         <div class="row">
           ${seeker ? `<a class="btn" href="${esc(navUrl)}" target="_blank" rel="noopener">${ICON.nav} Navigation</a>` : ''}
-          ${sim && seeker ? `<button class="btn" data-a="drive">${drive ? 'Fährt…' : 'Hinfahren (Sim.)'}</button>` : ''}
+          ${sim && seeker ? `<button class="btn" data-a="drive">${drive === 'routing' ? 'Route…' : drive ? 'Anhalten' : 'Hinfahren (Sim.)'}</button>` : ''}
         </div>
         <button class="btn ghost" data-a="cancel">Abbrechen</button>`;
     }
@@ -541,14 +630,15 @@ function live(){
     const d = matchDist(), md = $('#md'), me2 = $('#me2'), pg = $('#pg'), hint = $('#okHint');
     if (d != null && md){
       md.textContent = fmtD(d);
-      me2.textContent = match.role === 'seeker' ? `bis zur Lücke · ca. ${etaMin(d)} Min` : `entfernt · ca. ${etaMin(d)} Min`;
+      const eta = match.route && match.route.road && match.route.dur ? Math.max(1, Math.round(match.route.dur*d/Math.max(1, match.route.dist)/60)) : etaMin(d);
+      me2.textContent = (match.role === 'seeker' ? 'bis zur Lücke' : 'Fahrstrecke') + (match.route && match.route.road ? '' : ' (Luftlinie)') + ` · ca. ${eta} Min`;
       if (!match.start || d > match.start) match.start = Math.max(d, 50);
       pg.style.width = Math.round(100*Math.max(0, Math.min(1, 1 - (d - NEAR_M)/(match.start - NEAR_M)))) + '%';
     } else if (md){ md.textContent = '…'; }
-    const near = d != null && d <= NEAR_M;
+    const near = isNear();
     const ok = $('#okBtn');
-    if (ok) ok.disabled = !near && !(demo || manual);
-    if (hint) hint.textContent = match.meOk ? '' : near ? 'Ihr seid da. Jetzt beide bestätigen.' : (demo || manual) ? `Bestätigen geht ab ${NEAR_M} m Abstand (im Testmodus jederzeit).` : `Bestätigen geht, sobald ihr unter ${NEAR_M} m Abstand seid.`;
+    if (ok) ok.disabled = !near;
+    if (hint) hint.textContent = match.meOk ? '' : near ? 'Ihr seid da. Jetzt beide bestätigen.' : `Bestätigen geht erst, wenn ihr beide unter ${NEAR_M} m voneinander entfernt seid.`;
   }
 }
 function updPts(b){ const el = $('#pts'); el.querySelector('b').textContent = ME.points; if (b){ el.classList.remove('bump'); void el.offsetWidth; el.classList.add('bump'); } }
@@ -594,16 +684,27 @@ const PLATES = ['K LM 482', 'HH PA 77', 'B XY 2051', 'F MK 913', 'S RT 330', 'L 
 const sim = {
   v: new Map(),         // virtual offers
   seeker: null,         // virtual seeker coming to my spot
-  start(){
+  spawning: 0,
+  async start(){
     this.v.clear(); this.seeker = null;
-    if (pos) for (let i = 0; i < 4; i++) this.spawn();
+    if (pos) for (let i = 0; i < 4; i++) await this.spawn();
   },
-  stop(){ this.v.clear(); this.seeker = null; },
+  stop(){ this.v.clear(); if (this.seeker) clearInterval(this.seeker.timer); this.seeker = null; },
   rnd(a){ return a[Math.floor(Math.random()*a.length)]; },
-  spawn(){
-    if (!pos) return;
+  async spawn(){
+    if (!pos || this.spawning > 1) return;
+    this.spawning++;
+    let p = null;
+    try{
+      for (let k = 0; k < 4 && !p; k++){
+        const raw = offset(pos, 120 + Math.random()*650, Math.random()*360);
+        const sn = await snapToRoad(raw);
+        if (sn === undefined) p = raw;                       // routing service unreachable: keep raw point
+        else if (sn && [...this.v.values()].every(o => dist(o, sn) > 40)) p = sn;
+      }
+    } finally { this.spawning--; }
+    if (!p || !demo) return;
     const id = 'v_' + rid(6);
-    const p = offset(pos, 120 + Math.random()*650, Math.random()*360);
     this.v.set(id, {id, ...p, leaveAt: now() + (1 + Math.floor(Math.random()*9))*60000, car: {color: this.rnd(NAMES_COL), plate: this.rnd(PLATES)}, rep: {up: 5 + Math.floor(Math.random()*20), down: Math.floor(Math.random()*3)}, taken: false});
     this.emitOffers();
   },
@@ -612,7 +713,7 @@ const sim = {
   },
   tick(){
     if (!pos) return;
-    if (this.v.size === 0) this.start();
+    if (this.v.size === 0 && !this.spawning) this.start();
     if (tick % 4 === 0) this.emitOffers();
     if ([...this.v.values()].filter(o => !o.taken).length < 3 && Math.random() < .08) this.spawn();
     // virtual leaver at the spot keeps reporting its position
@@ -620,13 +721,20 @@ const sim = {
       const o = this.v.get(match.peer.id);
       if (o) onMsg({t: 'pos', from: o.id, to: ME.id, mid: match.mid, lat: o.lat, lng: o.lng});
     }
-    // virtual seeker drives to me
+    // virtual seeker drives to me along the streets
     const s = this.seeker;
-    if (s && match && match.mid === s.mid && s.go){
-      const tgt = myOffer || pos;
-      s.p = stepTo(s.p, tgt, 12);
-      onMsg({t: 'pos', from: s.id, to: ME.id, mid: s.mid, lat: s.p.lat, lng: s.p.lng});
-      if (dist(s.p, tgt) < 12 && !s.ok){ s.ok = true; setTimeout(() => onMsg({t: 'confirm', from: s.id, to: ME.id, mid: s.mid}), 1200); }
+    if (s && match && match.mid === s.mid && s.go && !s.w && !s.routing){
+      s.routing = true;
+      getRoute(s.p, match.spot).then(r => { s.routing = false; if (this.seeker === s){ s.w = walker(r.pts); s.timer = setInterval(() => this.driveSeeker(s), 400); } });
+    }
+  },
+  driveSeeker(s){
+    if (this.seeker !== s || !match || match.mid !== s.mid){ clearInterval(s.timer); return; }
+    s.p = s.w.step(5);                     // 12.5 m/s
+    onMsg({t: 'pos', from: s.id, to: ME.id, mid: s.mid, lat: s.p.lat, lng: s.p.lng});
+    if (s.w.done){
+      clearInterval(s.timer);
+      if (!s.ok){ s.ok = true; setTimeout(() => { if (match && match.mid === s.mid) onMsg({t: 'confirm', from: s.id, to: ME.id, mid: s.mid}); }, 1500); }
     }
   },
   recv(m){
@@ -641,13 +749,14 @@ const sim = {
       if (m.t === 'offer' && !this.seeker && S.mode === 'offering'){
         const id = 'v_' + rid(6);
         const p = offset({lat: m.lat, lng: m.lng}, 380 + Math.random()*300, Math.random()*360);
+        snapToRoad(p).then(sn => { if (sn && this.seeker && this.seeker.id === id && !this.seeker.go) this.seeker.p = sn; });
         this.seeker = {id, p, mid: rid(10), car: {color: this.rnd(NAMES_COL), plate: this.rnd(PLATES)}, rep: {up: 12, down: 1}, go: false};
         const s = this.seeker;
         setTimeout(() => { if (S.mode === 'offering' && this.seeker === s) onMsg({t: 'claim', from: s.id, to: ME.id, mid: s.mid, car: s.car, rep: s.rep, lat: s.p.lat, lng: s.p.lng}); }, 3500);
       }
       if (m.t === 'accept' && this.seeker && m.to === this.seeker.id) this.seeker.go = true;
       if (m.t === 'confirm' && match && m.to.startsWith('v_') && match.role === 'seeker') setTimeout(() => onMsg({t: 'confirm', from: m.to, to: ME.id, mid: m.mid}), 900);
-      if (m.t === 'cancel'){ if (this.seeker && m.to === this.seeker.id) this.seeker = null; const o = this.v.get(m.to); if (o){ o.taken = false; } }
+      if (m.t === 'cancel'){ if (this.seeker && m.to === this.seeker.id){ clearInterval(this.seeker.timer); this.seeker = null; } const o = this.v.get(m.to); if (o){ o.taken = false; } }
       if (m.t === 'withdraw' && this.seeker && !this.seeker.go) this.seeker = null;
       if (m.t === 'pos' || m.t === 'rate') {}
     }, 250);
