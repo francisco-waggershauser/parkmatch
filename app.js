@@ -11,6 +11,7 @@ const rid = n => Math.random().toString(36).slice(2, 2+n).padEnd(n, '0');
 const now = () => Date.now();
 const vib = p => { try{ navigator.vibrate && navigator.vibrate(p); }catch{} };
 
+const APP_VERSION = '202611241242';
 const COST = 10, START_POINTS = 50, NEAR_M = 40, RADIUS_M = 3000, NOTIFY_M = 1000;
 const TOPIC = 'parkmatch-mvp-x7k2/v1/all';
 const QB = new URLSearchParams(location.search).get('broker');
@@ -620,6 +621,7 @@ function viewSettings(){
     <div class="sw"><div><b>Demo-Modus</b><span>Virtuelle Fahrer in deiner Nähe, ideal zum Ausprobieren allein</span></div><button class="tg${demo ? ' on' : ''}" data-a="demo" aria-label="Demo-Modus"></button></div>
     <div class="sw"><div><b>Standort per Tippen</b><span>Statt GPS: tippe auf die Karte. Gut zum Testen am Schreibtisch</span></div><button class="tg${manual ? ' on' : ''}" data-a="manual" aria-label="Standort per Tippen"></button></div>
     <div class="sw"><div><b>${ME.points} Punkte · ${esc(repTxt(ME.rep))}</b><span>Verbindung: ${demo ? 'Demo (offline)' : netState === 'live' ? 'live' : 'wird aufgebaut'}</span></div></div>`}
+    ${ob ? '' : `<p class="hint">Version ${APP_VERSION}</p>`}
     <button class="btn pri" data-a="save" ${car.color ? '' : 'disabled'}>${ob ? 'Los geht’s' : 'Fertig'}</button>`;
 }
 function live(){
